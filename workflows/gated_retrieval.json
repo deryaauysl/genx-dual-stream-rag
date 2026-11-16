@@ -1,0 +1,472 @@
+{
+  "id": "GxGatedRetrvl001",
+  "name": "B - Gated Retrieval & Persona Synthesis",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Workflow B - Gated Retrieval & Persona Synthesis\n1. **Intent Router** (regex) answers greetings statically: no DB, no LLM\n2. Question -> bge-m3 embedding -> **Gated Vector Search** (raw SQL, `1 - (embedding <=> q)`)\n   frameworks >= 0.70 LIMIT 2, voice samples >= 0.65 LIMIT 2\n3. **Zero-Match Circuit Breaker**: 0 rows -> static fallback, LLM never called\n4. Otherwise -> few-shot **Persona Synthesis** in Dr. Sara's voice + exact source citations",
+        "height": 220,
+        "width": 760
+      },
+      "id": "bfda6253-446a-5340-b096-3976f20b7be6",
+      "name": "Note: Overview B",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "options": {
+          "responseMode": "lastNode"
+        }
+      },
+      "id": "e1d29a3f-2082-5410-8f62-e076a46b1da1",
+      "name": "Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        100
+      ],
+      "webhookId": "8b3858e4-42a8-57a2-b454-a6cc42956793"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "coach-chat",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "bf046bb2-ab4d-5b32-9a6b-760c612dc75c",
+      "name": "Webhook (POST /coach-chat)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "c461359c-42ad-545e-ad6d-68512e6e659c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Intent Router\"              (Code node - Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Runs before anything expensive. Normalises the incoming message from either\n// trigger (Chat Trigger -> chatInput, Webhook -> body.message) and uses a regex\n// to catch pure greetings (\"Hi\", \"Hello Dr. Sara!\", \"good morning\").\n// Greetings never reach the embedder, the database or the LLM.\n//\n// \"Hi, how do I delegate better?\" is NOT a pure greeting -> it is a question.\n// =============================================================================\n\nconst GREETING = /^\\s*(hi+|hello+|hey+|hiya|howdy|yo|greetings|good\\s+(morning|afternoon|evening|day)|merhaba|selam)\\b[\\s,!.]*((dr\\.?\\s*)?sara|there|team|everyone|all|coach)?[\\s,!.?:)]*$/i;\n\nconst j = $json;\nconst message = String(j.chatInput ?? j.body?.message ?? j.body?.chatInput ?? j.message ?? j.query ?? '').trim();\n\nlet intent = 'question';\nif (message === '') intent = 'empty';\nelse if (GREETING.test(message)) intent = 'greeting';\n\nreturn {\n  json: {\n    message,\n    intent,\n    sessionId: j.sessionId ?? j.body?.sessionId ?? null,\n  },\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "65f2e0a2-20e3-5229-9aee-f2eb67abd9a5",
+      "name": "Intent Router",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "99710ed5-7b18-5e4f-8ffb-90527e31a457",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "greeting"
+                  },
+                  {
+                    "id": "2a80149c-8dfc-5f25-8ba7-37526f0e8e67",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "empty"
+                  }
+                ],
+                "combinator": "or"
+              },
+              "renameOutput": true,
+              "outputKey": "Greeting"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "029c9b77-b7c9-5e5e-b005-5ded043362df",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "question"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Question"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ead4eeff-92e8-594c-a5f0-e4df7a7f536c",
+      "name": "Route Intent",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        460,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Static Greeting\"            (Code node - Run Once for Each Item)\n// No DB lookup, no embedding, no LLM call.\n// =============================================================================\n\nconst output = $json.intent === 'empty'\n  ? 'Ask me a leadership question and I will answer from Dr. Sara Hegy\\'s documented coaching frameworks.'\n  : 'Hi! I\\'m the GenX coaching assistant. I answer from Dr. Sara Hegy\\'s documented coaching frameworks. '\n    + 'Try asking: \"How should I approach an underperforming VP?\"';\n\nreturn { json: { output, route: 'greeting', llm_called: false, db_queried: false } };\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "350b0171-218f-5e15-ab02-0fa3ce617bcd",
+      "name": "Static Greeting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434') + '/api/embed' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.EMBED_MODEL || 'bge-m3', input: $json.message }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "d29cf863-6d3d-5759-ba80-a3541b9e03d6",
+      "name": "Embed Query (bge-m3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Validate Query Vector\"      (Code node - Run Once for Each Item)\n// Turns the Ollama /api/embed response into a pgvector literal for $1.\n// =============================================================================\n\nconst EXPECTED_DIM = 1024;\nconst vec = $json.embeddings?.[0] ?? $json.embedding;\n\nif (!Array.isArray(vec) || vec.length !== EXPECTED_DIM || !vec.every(Number.isFinite)) {\n  throw new Error(`Query embedding invalid: expected ${EXPECTED_DIM} dims, got ${Array.isArray(vec) ? vec.length : typeof vec}.`);\n}\n\nreturn {\n  json: {\n    message: $('Intent Router').item.json.message,\n    query_vector: `[${vec.join(',')}]`,\n  },\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "f651cd77-000f-5fa4-95ca-faebffd073ad",
+      "name": "Validate Query Vector",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Gated vector search. $1 = query embedding as a pgvector literal '[0.1, ...]'\n-- Similarity = 1 - cosine distance (<=>). Each stream has its own hard cutoff\n-- and its own LIMIT, so a strong framework match cannot crowd out voice samples\n-- (and vice versa). Anything under the bar never leaves the database.\nWITH q AS (\n    SELECT $1::vector(1024) AS v\n),\nframeworks AS (\n    SELECT kv.id, kv.session_id, kv.stream_type, kv.chunk_index, kv.content, kv.metadata,\n           1 - (kv.embedding <=> q.v) AS similarity\n    FROM knowledge_vault kv, q\n    WHERE kv.stream_type = 'framework'\n      AND 1 - (kv.embedding <=> q.v) >= 0.70\n    ORDER BY kv.embedding <=> q.v\n    LIMIT 2\n),\nvoice_samples AS (\n    SELECT kv.id, kv.session_id, kv.stream_type, kv.chunk_index, kv.content, kv.metadata,\n           1 - (kv.embedding <=> q.v) AS similarity\n    FROM knowledge_vault kv, q\n    WHERE kv.stream_type = 'voice_sample'\n      AND 1 - (kv.embedding <=> q.v) >= 0.65\n    ORDER BY kv.embedding <=> q.v\n    LIMIT 2\n)\nSELECT * FROM frameworks\nUNION ALL\nSELECT * FROM voice_samples;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.query_vector] }}"
+        }
+      },
+      "id": "f3bb6b99-d3ae-5c26-8739-ba638dbe1075",
+      "name": "Gated Vector Search",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1140,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GxPgvectorCred01",
+          "name": "GenX pgvector"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Zero-Match Circuit Breaker\"  (Code node - Run Once for All Items)\n// -----------------------------------------------------------------------------\n// \"Gated Vector Search\" has \"Always Output Data\" ON, so when no row clears the\n// thresholds it emits one empty item instead of stopping the workflow.\n// This node collapses the rows into a single decision item:\n//     match_count === 0  ->  IF node routes to the static fallback (no LLM call)\n//     match_count  >  0  ->  context is handed to persona synthesis\n// =============================================================================\n\nconst rows = $input.all()\n  .map((i) => i.json)\n  .filter((r) => r && typeof r.content === 'string' && r.content.trim() !== '');\n\nconst pick = (type) => rows\n  .filter((r) => r.stream_type === type)\n  .sort((a, b) => Number(b.similarity) - Number(a.similarity))\n  .map((r) => ({\n    session_id: r.session_id,\n    stream_type: r.stream_type,\n    chunk_index: r.chunk_index,\n    similarity: Math.round(Number(r.similarity) * 1000) / 1000,\n    content: r.content,\n    framework_name: r.metadata?.framework_name ?? null,\n  }));\n\nconst frameworks = pick('framework');\nconst voiceSamples = pick('voice_sample');\n\nreturn [{\n  json: {\n    message: $('Intent Router').first().json.message,\n    match_count: frameworks.length + voiceSamples.length,\n    frameworks,\n    voice_samples: voiceSamples,\n    sources: [...new Set(rows.map((r) => r.session_id))],\n  },\n}];\n"
+      },
+      "id": "d41e726e-3d67-5122-a0ba-5fdb95f9f5ce",
+      "name": "Zero-Match Circuit Breaker",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c245133e-dc41-55e6-b3fe-a82b9b315de4",
+              "leftValue": "={{ $json.match_count }}",
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              },
+              "rightValue": 0
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "df21a0e1-e594-588a-9a20-6106785dcfe1",
+      "name": "Any Chunk Passed Gate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1580,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Fallback Response\"          (Code node - Run Once for Each Item)\n// Reached only when zero chunks cleared the similarity gate.\n// The persona LLM node is never executed on this path.\n// =============================================================================\n\nreturn {\n  json: {\n    output: 'No documented coaching frameworks match this topic.',\n    route: 'circuit_breaker',\n    llm_called: false,\n    match_count: 0,\n  },\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "f20ce679-7d05-5fd7-8f3e-75e24736f641",
+      "name": "Fallback Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Build Persona Prompt\"       (Code node - Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Positive few-shot prompt design:\n//   * The system prompt describes what Dr. Sara DOES (no long list of bans).\n//   * Two worked examples (user -> assistant turns) show the target behaviour:\n//     teach the framework from CONTEXT, in the cadence of the VOICE SAMPLES.\n//     The example frameworks are illustrative and clearly labelled as such.\n//   * The real retrieved context is injected last, in the same format as the\n//     examples, so the model simply continues the pattern.\n// =============================================================================\n\nconst LLM_MODEL = $env.LLM_MODEL || 'llama3.2';\n\nconst SYSTEM = `You are Dr. Sara Hegy, executive coach at GenX Leadership Academy.\nA leader brings you a question. You answer it by teaching the documented framework in CONTEXT, in your own coaching voice.\n\nHow you answer:\n- Open with a reframe that names what the problem really is.\n- Name the framework from CONTEXT and walk the leader through it in two to four concrete moves.\n- Give them one diagnostic question to use, in quotes.\n- Close with a clear next action and when you will review it together.\n- Speak in short, declarative sentences: confident, warm and direct, addressed to \"you\".\n- Match the rhythm and phrasing of the VOICE SAMPLES.\n- Keep it between 120 and 200 words, in plain paragraphs.\n- Build every point from CONTEXT. When CONTEXT covers only part of the question, answer that part fully and invite them to bring the rest to your next session.`;\n\n// ---- Few-shot examples (illustrative frameworks, written in the target voice) ----\nconst EXAMPLES = [\n  {\n    user: `CONTEXT\n[FRAMEWORK] Framework: The Two-Lane Calendar\nUse when: a leader's week is swallowed by reactive meetings and there is no time left for strategy.\nCore idea: Overload is a design flaw in the calendar, not a discipline flaw in the person. Protected strategy blocks are scheduled first; reactive work fills what is left.\nHow to apply: 1. Audit last week's meetings. 2. Block two strategy mornings. 3. Route requests through a single intake slot.\nKey question: \"Which of these meetings would still happen if I were on vacation?\"\n\nVOICE SAMPLES\n[VOICE] Here's the thing. Your calendar is not a schedule, it is a policy. Every open slot is an invitation, and people accept invitations.\n\nQUESTION\nI'm in meetings all day and can't think strategically. What should I do?`,\n    assistant: `Here's the thing. You don't have a time problem. You have a calendar design problem, and that is fixable.\n\nWe use the Two-Lane Calendar. Strategy goes in first, reactive work fills what's left. Three moves.\n\nFirst, audit last week. Every meeting gets one test: \"Which of these meetings would still happen if I were on vacation?\" The ones that survive are the team's, not yours.\n\nSecond, block two strategy mornings before anyone else can claim them. Treat them like a board meeting.\n\nThird, give requests one intake slot. Every open slot is an invitation, and people accept invitations.\n\nThis week, run the audit and protect Tuesday and Thursday morning. We review what came back to you next session.`,\n  },\n  {\n    user: `CONTEXT\n[FRAMEWORK] Framework: Signal Before Story\nUse when: a leader receives harsh feedback from their team and feels defensive.\nCore idea: Separate the signal (the observable pattern) from the story (the meaning you attach). Respond to the signal first.\nHow to apply: 1. Write down the exact behaviour named. 2. Ask for one recent example. 3. Commit to one visible change.\nKey question: \"What would you need to see from me in the next two weeks?\"\n\nVOICE SAMPLES\n[VOICE] The reality is, defensiveness is just your nervous system protecting a story. Slow it down. Get curious before you get correct.\n\nQUESTION\nMy team said I'm hard to approach. How do I respond without getting defensive?`,\n    assistant: `The reality is, that sting you feel is your nervous system protecting a story. The feedback itself is just signal. Let's work with the signal.\n\nWe call this Signal Before Story. Two layers, handled in order.\n\nStart with the signal. Write down the exact behaviour they named, word for word. Then ask for one recent example, and listen without explaining.\n\nLeave the story for later. \"They think I'm a bad leader\" is meaning you added. Slow it down. Get curious before you get correct.\n\nThen commit to one visible change, and ask: \"What would you need to see from me in the next two weeks?\"\n\nHave that conversation this week. We check what you heard, and what you changed, in our next session.`,\n  },\n];\n\n// ---- Real context, injected in exactly the same format ---------------------\nconst fw = $json.frameworks.map((f) => `[FRAMEWORK] (${f.session_id}) ${f.content}`).join('\\n\\n');\nconst vs = $json.voice_samples.map((v) => `[VOICE] (${v.session_id}) ${v.content}`).join('\\n\\n');\n\nconst context = `CONTEXT\n${fw || '[FRAMEWORK] (no framework note cleared the threshold; teach from the voice samples)'}\n\nVOICE SAMPLES\n${vs || '[VOICE] (no voice sample cleared the threshold; use the voice shown in the examples)'}\n\nQUESTION\n${$json.message}`;\n\nconst messages = [{ role: 'system', content: SYSTEM }];\nfor (const ex of EXAMPLES) {\n  messages.push({ role: 'user', content: ex.user });\n  messages.push({ role: 'assistant', content: ex.assistant });\n}\nmessages.push({ role: 'user', content: context });\n\nreturn {\n  json: {\n    ...$json,\n    persona_request: {\n      model: LLM_MODEL,\n      stream: false,\n      options: { temperature: 0.4 },\n      messages,\n    },\n  },\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "48525466-40d6-5502-9e24-dc7b6c18cf3d",
+      "name": "Build Persona Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434') + '/api/chat' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.persona_request) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "4ea75dc2-8041-5e8b-96e6-86776393362b",
+      "name": "Persona Synthesis (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Format Answer\"              (Code node - Run Once for Each Item)\n// Final output for both the Chat UI (reads `output`) and the webhook caller.\n// Sources are appended by code, not by the LLM, so citations are always exact.\n// =============================================================================\n\nconst ctx = $('Build Persona Prompt').item.json;\nconst answer = String($json.message?.content ?? '').trim();\n\nconst cite = [...ctx.frameworks, ...ctx.voice_samples]\n  .map((c) => `${c.session_id} ${c.stream_type} #${c.chunk_index} (sim ${c.similarity})`)\n  .join(' | ');\n\nreturn {\n  json: {\n    output: `${answer}\\n\\n— Sources: ${cite}`,\n    route: 'persona_answer',\n    llm_called: true,\n    match_count: ctx.match_count,\n    sources: ctx.sources,\n    retrieved: [...ctx.frameworks, ...ctx.voice_samples].map(({ content, ...rest }) => rest),\n  },\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "fca9b460-538f-5bdf-b8a9-49dfae51b270",
+      "name": "Format Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2260,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "Intent Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook (POST /coach-chat)": {
+      "main": [
+        [
+          {
+            "node": "Intent Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Intent Router": {
+      "main": [
+        [
+          {
+            "node": "Route Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Intent": {
+      "main": [
+        [
+          {
+            "node": "Static Greeting",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Embed Query (bge-m3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Query (bge-m3)": {
+      "main": [
+        [
+          {
+            "node": "Validate Query Vector",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Query Vector": {
+      "main": [
+        [
+          {
+            "node": "Gated Vector Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gated Vector Search": {
+      "main": [
+        [
+          {
+            "node": "Zero-Match Circuit Breaker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zero-Match Circuit Breaker": {
+      "main": [
+        [
+          {
+            "node": "Any Chunk Passed Gate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Chunk Passed Gate?": {
+      "main": [
+        [
+          {
+            "node": "Build Persona Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fallback Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Persona Prompt": {
+      "main": [
+        [
+          {
+            "node": "Persona Synthesis (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persona Synthesis (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Format Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

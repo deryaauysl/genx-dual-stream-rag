@@ -1,0 +1,561 @@
+{
+  "id": "GxIngestFirewl01",
+  "name": "A - Ingestion & Semantic Firewall",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Workflow A - Ingestion & Semantic Firewall\n1. Read `/data/mock_transcripts.json` -> **Bounded Sampler** (first 40 + last 20 turns)\n2. **Classification Agent** (llama3.2, strict JSON schema) -> **Parse & Validate** (fails closed)\n3. **Ingestion Gate** (Switch): only `Client Coaching` with confidence >= 0.80 passes\n4. Rejected -> `archived_sessions` (flat table, **no embeddings**)\n5. Approved -> **Framework Distiller** + **Dual-Stream Parser** -> bge-m3 -> `knowledge_vault` upsert",
+        "height": 200,
+        "width": 760
+      },
+      "id": "877cf6d4-e72f-5268-b85b-12d3ea526614",
+      "name": "Note: Overview A",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -260
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "0ab8b7a2-a1ca-5f5d-86ce-36cc920d2b70",
+      "name": "Start Ingestion (Manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ingest",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "86a2f1ad-a4f5-5d17-a40f-58c14dc63753",
+      "name": "Start Ingestion (Webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "244d6392-3a12-5afc-ad1d-6936e9a26a87"
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "/data/mock_transcripts.json",
+        "options": {}
+      },
+      "id": "830e2405-01d2-5557-b441-0fb03299609a",
+      "name": "Read Transcripts File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        240,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "options": {}
+      },
+      "id": "b6fa3e46-62ec-5a4a-97f0-420a845cc399",
+      "name": "Parse JSON File",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        460,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Bounded Sampler\"            (Code node - Run Once for All Items)\n// -----------------------------------------------------------------------------\n// Input : output of \"Parse JSON File\" -> one item whose json.data is the array\n//         of sessions from data/mock_transcripts.json. (Also tolerates one item\n//         per session, in case the file is fed in a different way.)\n// Output: ONE item per session, carrying\n//           - the full session (needed later by the dual-stream parser)\n//           - a bounded sample: first 40 turns + last 20 turns\n//           - a ready-to-send Ollama /api/chat request for the classifier\n// =============================================================================\n\nconst HEAD_TURNS = 40;\nconst TAIL_TURNS = 20;\nconst LLM_MODEL = $env.LLM_MODEL || 'llama3.2';\n\n// ---- 1. Collect sessions regardless of how the file was unwrapped ----------\nconst sessions = [];\nfor (const item of $input.all()) {\n  const j = item.json ?? {};\n  if (Array.isArray(j.data)) sessions.push(...j.data);\n  else if (Array.isArray(j.sessions)) sessions.push(...j.sessions);\n  else if (Array.isArray(j.transcript)) sessions.push(j);\n}\n\nif (sessions.length === 0) {\n  throw new Error('Bounded Sampler: no sessions found. Expected a JSON array of sessions with a \"transcript\" array.');\n}\n\n// ---- 2. Helpers -------------------------------------------------------------\n/**\n * First HEAD + last TAIL turns. If the transcript is short enough that the two\n * windows would overlap, the whole transcript is returned once (no duplicates).\n */\nfunction boundedSample(turns, head = HEAD_TURNS, tail = TAIL_TURNS) {\n  if (turns.length <= head + tail) {\n    return { turns: turns.slice(), truncated: false, omitted: 0 };\n  }\n  return {\n    turns: [...turns.slice(0, head), ...turns.slice(-tail)],\n    truncated: true,\n    omitted: turns.length - head - tail,\n  };\n}\n\nfunction roleOf(speaker, participants) {\n  const p = participants.find((x) => x.name === speaker);\n  if (!p) return 'unknown';\n  return p.is_team_member ? 'GenX team member' : 'external guest';\n}\n\nfunction renderTurns(turns, participants, truncated, omitted) {\n  const lines = [];\n  turns.forEach((t, i) => {\n    if (truncated && i === HEAD_TURNS) lines.push(`... [${omitted} middle turns omitted] ...`);\n    lines.push(`[${t.timestamp ?? '--:--:--'}] ${t.speaker} (${roleOf(t.speaker, participants)}): ${String(t.text ?? '').trim()}`);\n  });\n  return lines.join('\\n');\n}\n\n// ---- 3. Classifier prompt (strict JSON via Ollama structured outputs) ------\nconst CLASSIFIER_SYSTEM = [\n  'You are the ingestion gatekeeper for the GenX Leadership Academy coaching knowledge base.',\n  'Read the meeting sample and decide which kind of meeting it is.',\n  '',\n  'Categories:',\n  '- \"Client Coaching\": a coach works with an external client on leadership, wellbeing, delegation, team dynamics, feedback or personal performance.',\n  '- \"Internal Operations\": GenX team members talk among themselves about engineering, tooling, CRM, sprints, deployments, admin or internal process.',\n  '- \"Sales Discovery\": a conversation about buying coaching services: pricing, budget, retainers, contracts, pilots, proposals or scope of work.',\n  '- \"Other\": anything else, or not enough signal to decide.',\n  '',\n  'confidence_score is your probability (0.0 to 1.0) that meeting_type is correct.',\n  'summary is one or two sentences describing what the meeting was about.',\n  'Answer with a single JSON object: {\"meeting_type\": \"...\", \"confidence_score\": 0.0, \"summary\": \"...\"}',\n].join('\\n');\n\nconst CLASSIFIER_SCHEMA = {\n  type: 'object',\n  properties: {\n    meeting_type: {\n      type: 'string',\n      enum: ['Client Coaching', 'Internal Operations', 'Sales Discovery', 'Other'],\n    },\n    confidence_score: { type: 'number' },\n    summary: { type: 'string' },\n  },\n  required: ['meeting_type', 'confidence_score', 'summary'],\n};\n\n// ---- 4. Emit one item per session --------------------------------------------\nreturn sessions.map((s) => {\n  const participants = Array.isArray(s.participants) ? s.participants : [];\n  const transcript = Array.isArray(s.transcript) ? s.transcript : [];\n  const sample = boundedSample(transcript);\n  const sampleText = renderTurns(sample.turns, participants, sample.truncated, sample.omitted);\n\n  const participantLine = participants\n    .map((p) => `${p.name} (${p.is_team_member ? 'GenX team member' : 'external guest'})`)\n    .join(', ');\n\n  return {\n    json: {\n      session_id: s.id,\n      title: s.title ?? '',\n      source_created_at: s.created_at ?? null,\n      participants,\n      transcript,\n      turn_count: transcript.length,\n      sample_turn_count: sample.turns.length,\n      sample_truncated: sample.truncated,\n      sample_text: sampleText,\n      classifier_request: {\n        model: LLM_MODEL,\n        stream: false,\n        format: CLASSIFIER_SCHEMA,\n        options: { temperature: 0 },\n        messages: [\n          { role: 'system', content: CLASSIFIER_SYSTEM },\n          {\n            role: 'user',\n            content: `Meeting title: ${s.title ?? '(none)'}\\nParticipants: ${participantLine}\\n\\nTranscript sample (${sample.turns.length} of ${transcript.length} turns):\\n${sampleText}`,\n          },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "1495a24e-1f93-5ffd-abf1-860d522a5728",
+      "name": "Bounded Sampler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434') + '/api/chat' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.classifier_request) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "1ec6fdac-849f-59b7-bc78-9ca497e01d13",
+      "name": "Classification Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Parse & Validate Classification\"   (Code node - Run Once for All Items)\n// -----------------------------------------------------------------------------\n// Input : responses of the \"Classification Agent\" HTTP node (Ollama /api/chat).\n//         That node has \"On Error: Continue\", so an item may be an error object.\n// Output: the original session + a normalised, always-valid classification:\n//           meeting_type     one of the 4 allowed labels\n//           confidence_score number clamped to [0, 1]\n//           summary          string\n//         Anything malformed degrades to { \"Other\", 0 } -> it gets ARCHIVED,\n//         never ingested. The gate fails closed.\n// =============================================================================\n\nconst ALLOWED = ['Client Coaching', 'Internal Operations', 'Sales Discovery', 'Other'];\n\n/** Pull the first JSON object out of an LLM reply (handles ```json fences / chatter). */\nfunction extractJson(raw) {\n  if (raw && typeof raw === 'object') return raw;\n  if (typeof raw !== 'string' || !raw.trim()) return null;\n  const text = raw.replace(/```(?:json)?/gi, '').trim();\n  try { return JSON.parse(text); } catch (_) { /* fall through */ }\n  const start = text.indexOf('{');\n  const end = text.lastIndexOf('}');\n  if (start === -1 || end <= start) return null;\n  try { return JSON.parse(text.slice(start, end + 1)); } catch (_) { return null; }\n}\n\n/** Map near-misses (\"client coaching session\", \"SALES\") onto the allowed labels. */\nfunction normaliseType(value) {\n  const v = String(value ?? '').toLowerCase().trim();\n  const exact = ALLOWED.find((a) => a.toLowerCase() === v);\n  if (exact) return exact;\n  if (v.includes('coach')) return 'Client Coaching';\n  if (v.includes('internal') || v.includes('operation')) return 'Internal Operations';\n  if (v.includes('sales') || v.includes('discovery')) return 'Sales Discovery';\n  return 'Other';\n}\n\n/** Accept 0.92, \"0.92\", \"92%\", 92 -> 0.92. Garbage -> 0. */\nfunction normaliseConfidence(value) {\n  let n = typeof value === 'string' ? parseFloat(value.replace('%', '')) : Number(value);\n  if (!Number.isFinite(n)) return 0;\n  if (n > 1 && n <= 100) n = n / 100;\n  return Math.min(1, Math.max(0, Math.round(n * 1000) / 1000));\n}\n\nconst out = [];\n$input.all().forEach((item, i) => {\n  const session = $('Bounded Sampler').itemMatching(i).json;\n  const res = item.json ?? {};\n\n  const raw = res?.message?.content ?? res?.response ?? null;\n  const parsed = res.error ? null : extractJson(raw);\n\n  let classification;\n  if (parsed && typeof parsed === 'object') {\n    classification = {\n      meeting_type: normaliseType(parsed.meeting_type),\n      confidence_score: normaliseConfidence(parsed.confidence_score),\n      summary: String(parsed.summary ?? '').trim(),\n      parse_ok: true,\n    };\n  } else {\n    classification = {\n      meeting_type: 'Other',\n      confidence_score: 0,\n      summary: '',\n      parse_ok: false,\n      parse_error: res.error ? `LLM call failed: ${res.error.message ?? JSON.stringify(res.error)}` : 'Could not parse classifier output as JSON',\n    };\n  }\n\n  // Drop the large request payload, keep everything the next nodes need.\n  const { classifier_request, ...rest } = session;\n  out.push({\n    json: {\n      ...rest,\n      ...classification,\n      classifier_raw: typeof raw === 'string' ? raw : JSON.stringify(raw ?? res),\n    },\n    pairedItem: { item: i },\n  });\n});\n\nreturn out;\n"
+      },
+      "id": "29df6525-4a73-5c42-a9c7-a3d75159eb0c",
+      "name": "Parse & Validate Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c27563cf-4687-56c4-bd5a-7e4293db3213",
+                    "leftValue": "={{ $json.meeting_type }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "Client Coaching"
+                  },
+                  {
+                    "id": "6b2baa3d-8fb5-5608-bbca-bcf30ee02545",
+                    "leftValue": "={{ $json.confidence_score }}",
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    },
+                    "rightValue": 0.8
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Pass: Client Coaching >= 0.80"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "b0773a2b-7930-56b1-97fd-e68ab747e5f7",
+                    "leftValue": "={{ $json.meeting_type }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "Internal Operations"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Reject: Internal Operations"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "d5ee0a27-2df9-5afc-946c-6827cc6a9180",
+                    "leftValue": "={{ $json.meeting_type }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "Sales Discovery"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Reject: Sales Discovery"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Reject: Other / low confidence"
+        }
+      },
+      "id": "b8ab67ec-03c2-56bf-ab79-869044345b32",
+      "name": "Ingestion Gate",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1340,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Prepare Archive Row\"        (Code node - Run Once for All Items)\n// -----------------------------------------------------------------------------\n// Receives every session the Ingestion Gate rejected (Internal Operations,\n// Sales Discovery, Other, or Client Coaching below the 0.80 confidence bar)\n// and shapes it into a flat relational row. No embedding is ever computed here.\n// =============================================================================\n\nconst MIN_CONFIDENCE = 0.8;\n\nreturn $input.all().map((item) => {\n  const s = item.json;\n  const reason = s.meeting_type === 'Client Coaching'\n    ? `low_confidence (${s.confidence_score} < ${MIN_CONFIDENCE})`\n    : `classified_as_${s.meeting_type.toLowerCase().replace(/\\s+/g, '_')}`;\n\n  return {\n    json: {\n      session_id: s.session_id,\n      title: s.title,\n      source_created_at: s.source_created_at,\n      meeting_type: s.meeting_type,\n      confidence_score: s.confidence_score,\n      summary: s.summary,\n      reject_reason: s.parse_ok === false ? `unparseable_classification: ${s.parse_error}` : reason,\n      participants_json: JSON.stringify(s.participants ?? []),\n      transcript_json: JSON.stringify(s.transcript ?? []),\n      classifier_raw: s.classifier_raw ?? null,\n    },\n  };\n});\n"
+      },
+      "id": "2fe7a758-e55e-51e1-b61a-e6ed5c3acf17",
+      "name": "Prepare Archive Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Rejected sessions: flat relational row, no embedding is ever generated.\n-- If the session had been ingested by an earlier run, its vectors are purged.\nWITH purge_vectors AS (\n    DELETE FROM knowledge_vault WHERE session_id = $1\n)\nINSERT INTO archived_sessions\n    (session_id, title, source_created_at, meeting_type, confidence_score,\n     summary, reject_reason, participants, transcript, classifier_raw)\nVALUES ($1, $2, $3::timestamptz, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10)\nON CONFLICT (session_id) DO UPDATE\nSET title = EXCLUDED.title,\n    meeting_type = EXCLUDED.meeting_type,\n    confidence_score = EXCLUDED.confidence_score,\n    summary = EXCLUDED.summary,\n    reject_reason = EXCLUDED.reject_reason,\n    participants = EXCLUDED.participants,\n    transcript = EXCLUDED.transcript,\n    classifier_raw = EXCLUDED.classifier_raw,\n    archived_at = now()\nRETURNING session_id, meeting_type, confidence_score, reject_reason;",
+        "options": {
+          "queryReplacement": "={{ [$json.session_id, $json.title, $json.source_created_at, $json.meeting_type, $json.confidence_score, $json.summary, $json.reject_reason, $json.participants_json, $json.transcript_json, $json.classifier_raw] }}"
+        }
+      },
+      "id": "973b7b27-95d7-5d00-a040-13718d1165a9",
+      "name": "Archive Rejected Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1820,
+        460
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GxPgvectorCred01",
+          "name": "GenX pgvector"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Prepare Framework Distillation\"   (Code node - Run Once for All Items)\n// -----------------------------------------------------------------------------\n// For every APPROVED coaching session, build an Ollama /api/chat request that\n// condenses the full transcript into a dense framework note (Stream 1).\n// The note follows a fixed, positively-phrased template, including a\n// \"Use when\" line written in the words a leader would use when asking,\n// which makes the note easy to match against real questions.\n// =============================================================================\n\nconst LLM_MODEL = $env.LLM_MODEL || 'llama3.2';\n\nconst DISTILLER_SYSTEM = [\n  'You turn an executive-coaching session into a dense framework note for a coaching knowledge base.',\n  'Build the note only from ideas the coach actually expressed in the transcript.',\n  '',\n  'Write plain text in exactly this layout:',\n  'Framework: <the name the coach used, or a short descriptive name>',\n  'Use when: <the leadership situations it applies to, in the plain words a leader would use when asking for help>',\n  'Core idea: <two or three sentences>',\n  'How to apply: <three to five short numbered steps>',\n  'Key question: <the diagnostic question or signature line the coach used>',\n  '',\n  'Keep the whole note under 900 characters.',\n].join('\\n');\n\nreturn $input.all().map((item) => {\n  const s = item.json;\n  const transcriptText = (s.transcript ?? [])\n    .map((t) => `${t.speaker}: ${String(t.text ?? '').trim()}`)\n    .join('\\n');\n\n  return {\n    json: {\n      ...s,\n      distiller_request: {\n        model: LLM_MODEL,\n        stream: false,\n        options: { temperature: 0.2 },\n        messages: [\n          { role: 'system', content: DISTILLER_SYSTEM },\n          {\n            role: 'user',\n            content: `Session ${s.session_id} - \"${s.title}\"\\nClassifier summary: ${s.summary}\\n\\nFull transcript:\\n${transcriptText}`,\n          },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "bab89e4c-330c-58ea-a041-23aaa948da0f",
+      "name": "Prepare Framework Distillation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434') + '/api/chat' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.distiller_request) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "684f695e-d7ac-5456-8a60-45135e8f0b8a",
+      "name": "Framework Distiller (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1820,
+        40
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Dual-Stream Parser\"         (Code node - Run Once for All Items)\n// -----------------------------------------------------------------------------\n// Input : responses of \"Framework Distiller (LLM)\", paired with the approved\n//         sessions from \"Prepare Framework Distillation\".\n// Output: ONE item per chunk to embed, for both streams:\n//\n//   Stream 1  framework     dense conceptual takeaway of the coaching framework\n//                           (LLM-distilled; extractive fallback if the LLM\n//                           output is empty/unusable)\n//   Stream 2  voice_sample  the coach's verbatim turns only, in 400-700 char\n//                           chunks. Sentence boundaries are never cut, turns\n//                           are separated by a blank line to keep the rhythm.\n// =============================================================================\n\nconst MIN_CHARS = 400;\nconst MAX_CHARS = 700;\nconst IDEAL_CHARS = 550;\n\n// ---------------------------------------------------------------------------\n// Speaker filtering\n// ---------------------------------------------------------------------------\n/** The coach = the GenX team member who speaks the most in the session. */\nfunction identifyCoach(session) {\n  const team = new Set((session.participants ?? []).filter((p) => p.is_team_member).map((p) => p.name));\n  const words = {};\n  for (const t of session.transcript ?? []) {\n    words[t.speaker] = (words[t.speaker] ?? 0) + String(t.text ?? '').split(/\\s+/).length;\n  }\n  const ranked = Object.entries(words).sort((a, b) => b[1] - a[1]).map(([name]) => name);\n  return ranked.find((n) => team.has(n)) ?? ranked.find((n) => /^dr\\.?\\s/i.test(n)) ?? ranked[0];\n}\n\nconst clean = (s) => String(s ?? '').replace(/\\s+/g, ' ').trim();\n\n// ---------------------------------------------------------------------------\n// Sentence splitting (protects \"Dr.\", \"e.g.\" etc. from false splits)\n// ---------------------------------------------------------------------------\nconst ABBREV = /\\b(Dr|Mr|Mrs|Ms|Prof|Sr|Jr|vs|etc|e\\.g|i\\.e)\\./gi;\nfunction splitSentences(text) {\n  const protectedText = text.replace(ABBREV, (m) => m.replace(/\\./g, '\\u0000'));\n  return protectedText\n    .split(/(?<=[.!?]['\"’”]?)\\s+(?=['\"‘“]?[A-Z0-9])/)\n    .map((s) => s.replace(/\\u0000/g, '.').trim())\n    .filter(Boolean)\n    .flatMap((s) => (s.length <= MAX_CHARS ? [s] : hardSplit(s)));\n}\n/** Only for a single sentence longer than MAX_CHARS: cut at word boundaries. */\nfunction hardSplit(s) {\n  const parts = [];\n  let rest = s;\n  while (rest.length > MAX_CHARS) {\n    let cut = rest.lastIndexOf(' ', MAX_CHARS);\n    if (cut < MIN_CHARS) cut = MAX_CHARS;\n    parts.push(rest.slice(0, cut).trim());\n    rest = rest.slice(cut).trim();\n  }\n  if (rest) parts.push(rest);\n  return parts;\n}\n\n// ---------------------------------------------------------------------------\n// Voice chunking: optimal partition of sentence units into 400-700 char chunks\n// ---------------------------------------------------------------------------\n/** units: [{ text, turnIdx, timestamp }] -> joined text (blank line between turns) */\nfunction joinUnits(units) {\n  let out = '';\n  units.forEach((u, k) => {\n    if (k > 0) out += u.turnIdx === units[k - 1].turnIdx ? ' ' : '\\n\\n';\n    out += u.text;\n  });\n  return out;\n}\n\nfunction chunkCost(len) {\n  if (len >= MIN_CHARS && len <= MAX_CHARS) return ((len - IDEAL_CHARS) / 100) ** 2;\n  const miss = len < MIN_CHARS ? MIN_CHARS - len : len - MAX_CHARS;\n  return 1e6 + miss * miss; // out-of-bounds chunks only if nothing else is possible\n}\n\n/** Dynamic programming over sentence boundaries -> minimal total cost. */\nfunction partition(units) {\n  const n = units.length;\n  const best = new Array(n + 1).fill(Infinity);\n  const prev = new Array(n + 1).fill(-1);\n  best[0] = 0;\n  for (let i = 1; i <= n; i++) {\n    for (let j = i - 1; j >= 0; j--) {\n      const len = joinUnits(units.slice(j, i)).length;\n      if (len > MAX_CHARS && i - j > 1) break; // longer windows only get longer\n      const c = best[j] + chunkCost(len);\n      if (c < best[i]) { best[i] = c; prev[i] = j; }\n    }\n  }\n  const ranges = [];\n  for (let i = n; i > 0; i = prev[i]) ranges.unshift([prev[i], i]);\n  return ranges;\n}\n\n/**\n * If a chunk is still below MIN_CHARS (total coach text did not divide cleanly\n * at sentence boundaries), borrow whole neighbouring sentences as overlap:\n * first the preceding ones, then the following ones, never exceeding MAX_CHARS.\n */\nfunction applyOverlap(units, ranges) {\n  const len = (s, e) => joinUnits(units.slice(s, e)).length;\n  return ranges.map(([start, end]) => {\n    let s = start;\n    let e = end;\n    while (s > 0 && len(s, e) < MIN_CHARS && len(s - 1, e) <= MAX_CHARS) s--;\n    while (e < units.length && len(s, e) < MIN_CHARS && len(s, e + 1) <= MAX_CHARS) e++;\n    return { start: s, end: e, overlap_units: (start - s) + (e - end) };\n  });\n}\n\nfunction buildVoiceChunks(session, coach) {\n  const turns = (session.transcript ?? [])\n    .map((t, idx) => ({ ...t, idx }))\n    .filter((t) => t.speaker === coach && clean(t.text));\n\n  const units = turns.flatMap((t) =>\n    splitSentences(clean(t.text)).map((text) => ({ text, turnIdx: t.idx, timestamp: t.timestamp })));\n  if (units.length === 0) return [];\n\n  return applyOverlap(units, partition(units)).map(({ start, end, overlap_units }) => {\n    const slice = units.slice(start, end);\n    const content = joinUnits(slice);\n    return {\n      content,\n      speaker: coach,\n      timestamps: [...new Set(slice.map((u) => u.timestamp))],\n      turn_count: new Set(slice.map((u) => u.turnIdx)).size,\n      char_count: content.length,\n      within_bounds: content.length >= MIN_CHARS && content.length <= MAX_CHARS,\n      overlap_sentences: overlap_units,\n    };\n  });\n}\n\n// ---------------------------------------------------------------------------\n// Framework stream\n// ---------------------------------------------------------------------------\nfunction cleanDistilled(text) {\n  return String(text ?? '')\n    .replace(/\\*\\*|__|`/g, '')\n    .replace(/^#+\\s*/gm, '')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n}\n\nfunction frameworkName(text) {\n  const fromNote = text.match(/^\\s*Framework:\\s*(.+)$/im);\n  if (fromNote) return fromNote[1].trim().replace(/[.\"]+$/, '');\n  const fromTalk = text.match(/(?:framework called|we run the|we use the)\\s+(?:the\\s+)?([A-Z][\\w-]*(?:\\s+(?:[A-Z][\\w-]*|and|with|of)){0,5})/);\n  return fromTalk ? fromTalk[1].trim() : null;\n}\n\n/** Fallback if the LLM output is unusable: stitch the coach's teaching turns. */\nfunction extractiveFramework(session, coach) {\n  const coachTurns = (session.transcript ?? []).filter((t) => t.speaker === coach).map((t) => clean(t.text));\n  const clientTurns = (session.transcript ?? []).filter((t) => t.speaker !== coach).map((t) => clean(t.text));\n  const name = frameworkName(coachTurns.join(' ')) ?? `${session.title} coaching approach`;\n  // Client's opening problem, minus a leading greeting sentence (\"Hi Dr. Sara.\")\n  const problem = splitSentences(clientTurns[0] ?? session.summary ?? '')\n    .filter((s, idx) => !(idx === 0 && /^(hi|hey|hello)\\b/i.test(s))).join(' ');\n  const keyQuestion = coachTurns.flatMap(splitSentences).find((s) => s.includes('?'))\n    ?? coachTurns[coachTurns.length - 1] ?? '';\n  return [\n    `Framework: ${name}`,\n    `Use when: ${problem}`,\n    `Core idea: ${coachTurns.slice(0, 2).join(' ')}`,\n    `Key question: ${keyQuestion}`,\n  ].join('\\n');\n}\n\n// ---------------------------------------------------------------------------\n// Main\n// ---------------------------------------------------------------------------\nconst out = [];\n$input.all().forEach((item, i) => {\n  const session = $('Prepare Framework Distillation').itemMatching(i).json;\n  const coach = identifyCoach(session);\n\n  const distilled = cleanDistilled(item.json?.message?.content);\n  const useLlm = !item.json?.error && distilled.length >= 120 && /framework:/i.test(distilled);\n  const frameworkText = useLlm ? distilled : extractiveFramework(session, coach);\n\n  const shared = {\n    title: session.title,\n    session_date: session.source_created_at,\n    coach,\n    client: (session.participants ?? []).filter((p) => !p.is_team_member).map((p) => p.name),\n    meeting_type: session.meeting_type,\n    classifier_confidence: session.confidence_score,\n    classifier_summary: session.summary,\n  };\n\n  // Stream 1: framework\n  const frameworks = [{\n    content: frameworkText,\n    metadata: { ...shared, framework_name: frameworkName(frameworkText), source: useLlm ? 'llm_distilled' : 'extractive_fallback', char_count: frameworkText.length },\n  }];\n\n  // Stream 2: voice_sample\n  const voices = buildVoiceChunks(session, coach).map(({ content, ...meta }) => ({\n    content,\n    metadata: { ...shared, ...meta },\n  }));\n\n  const emit = (stream_type, arr) => arr.forEach((c, idx) => out.push({\n    json: {\n      session_id: session.session_id,\n      stream_type,\n      chunk_index: idx,\n      chunk_total: arr.length,\n      content: c.content,\n      metadata: c.metadata,\n    },\n    pairedItem: { item: i },\n  }));\n\n  emit('framework', frameworks);\n  emit('voice_sample', voices);\n});\n\nreturn out;\n"
+      },
+      "id": "c45fe685-d694-5dfd-b964-466bbba79515",
+      "name": "Dual-Stream Parser",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2040,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434') + '/api/embed' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.EMBED_MODEL || 'bge-m3', input: $json.content }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "c2ff7722-3577-5459-b7a3-54ec3083844b",
+      "name": "Embed Chunk (bge-m3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2260,
+        40
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================================\n// Node: \"Prepare Vector Row\"         (Code node - Run Once for All Items)\n// -----------------------------------------------------------------------------\n// Pairs each Ollama /api/embed response with its chunk and validates the\n// vector before it touches the database: right dimension, finite numbers.\n// A bad embedding stops the run loudly instead of silently corrupting the vault.\n// =============================================================================\n\nconst EXPECTED_DIM = 1024; // bge-m3; must match vector(1024) in init.sql\n\nreturn $input.all().map((item, i) => {\n  const chunk = $('Dual-Stream Parser').itemMatching(i).json;\n  const vec = item.json?.embeddings?.[0] ?? item.json?.embedding;\n\n  if (!Array.isArray(vec) || vec.length !== EXPECTED_DIM || !vec.every(Number.isFinite)) {\n    throw new Error(\n      `Embedding for ${chunk.session_id}/${chunk.stream_type}#${chunk.chunk_index} is invalid ` +\n      `(got ${Array.isArray(vec) ? vec.length : typeof vec} dims, expected ${EXPECTED_DIM}). ` +\n      'Check that EMBED_MODEL is bge-m3 and Ollama is reachable.',\n    );\n  }\n\n  return {\n    json: {\n      session_id: chunk.session_id,\n      stream_type: chunk.stream_type,\n      chunk_index: chunk.chunk_index,\n      chunk_total: chunk.chunk_total,\n      content: chunk.content,\n      metadata_json: JSON.stringify({ ...chunk.metadata, embed_model: item.json?.model ?? 'bge-m3' }),\n      embedding_literal: `[${vec.join(',')}]`, // pgvector text format\n    },\n    pairedItem: { item: i },\n  };\n});\n"
+      },
+      "id": "7b6dd28f-a381-57e1-a9e2-5f88999760fa",
+      "name": "Prepare Vector Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Upsert one chunk. Re-running ingestion is idempotent:\n--   * stale chunks with a higher index (from an older, longer run) are purged\n--   * a session that was archived earlier is removed from the archive\nWITH purge_stale AS (\n    DELETE FROM knowledge_vault\n    WHERE session_id = $1 AND stream_type = $2 AND chunk_index >= $7\n), purge_archive AS (\n    DELETE FROM archived_sessions WHERE session_id = $1\n)\nINSERT INTO knowledge_vault (session_id, stream_type, chunk_index, content, metadata, embedding)\nVALUES ($1, $2, $3, $4, $5::jsonb, $6::vector(1024))\nON CONFLICT (session_id, stream_type, chunk_index) DO UPDATE\nSET content    = EXCLUDED.content,\n    metadata   = EXCLUDED.metadata,\n    embedding  = EXCLUDED.embedding,\n    updated_at = now()\nRETURNING id, session_id, stream_type, chunk_index, length(content) AS chars;",
+        "options": {
+          "queryReplacement": "={{ [$json.session_id, $json.stream_type, $json.chunk_index, $json.content, $json.metadata_json, $json.embedding_literal, $json.chunk_total] }}"
+        }
+      },
+      "id": "7a706b49-5be0-54dc-9c4e-1a37712f54fa",
+      "name": "Upsert to knowledge_vault",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2700,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "GxPgvectorCred01",
+          "name": "GenX pgvector"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Start Ingestion (Manual)": {
+      "main": [
+        [
+          {
+            "node": "Read Transcripts File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Ingestion (Webhook)": {
+      "main": [
+        [
+          {
+            "node": "Read Transcripts File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Transcripts File": {
+      "main": [
+        [
+          {
+            "node": "Parse JSON File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse JSON File": {
+      "main": [
+        [
+          {
+            "node": "Bounded Sampler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bounded Sampler": {
+      "main": [
+        [
+          {
+            "node": "Classification Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classification Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Classification": {
+      "main": [
+        [
+          {
+            "node": "Ingestion Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ingestion Gate": {
+      "main": [
+        [
+          {
+            "node": "Prepare Framework Distillation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Archive Row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Archive Row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Archive Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Archive Row": {
+      "main": [
+        [
+          {
+            "node": "Archive Rejected Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Framework Distillation": {
+      "main": [
+        [
+          {
+            "node": "Framework Distiller (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Framework Distiller (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Dual-Stream Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dual-Stream Parser": {
+      "main": [
+        [
+          {
+            "node": "Embed Chunk (bge-m3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Chunk (bge-m3)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Vector Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Vector Row": {
+      "main": [
+        [
+          {
+            "node": "Upsert to knowledge_vault",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

@@ -1,0 +1,125 @@
+# =============================================================================
+# GenX Bounded Dual-Stream RAG - one-command local stack
+#
+#   docker compose up -d
+#
+# Services
+#   postgres    pgvector/pgvector:pg16, schema + HNSW index from ./init.sql
+#   n8n-import  one-shot: imports the Postgres credential + both workflows
+#               (and publishes them) into n8n, then exits
+#   n8n         the editor / runtime on http://localhost:5678
+#   ollama      OPTIONAL (profile "ollama") - by default n8n talks to the
+#               Ollama already running on your host machine
+# =============================================================================
+
+name: genx-rag
+
+x-n8n-env: &n8n-env
+  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-genx-local-dev-encryption-key-change-me}
+  GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+  TZ: ${GENERIC_TIMEZONE:-UTC}
+  N8N_SECURE_COOKIE: "false"
+  N8N_DIAGNOSTICS_ENABLED: "false"
+  N8N_PERSONALIZATION_ENABLED: "false"
+  N8N_RUNNERS_ENABLED: "true"
+  # Workflows read OLLAMA_BASE_URL / LLM_MODEL / EMBED_MODEL via $env
+  N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+  # "Read Transcripts File" may only read from the mounted data folder
+  N8N_RESTRICT_FILE_ACCESS_TO: /data
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  LLM_MODEL: ${LLM_MODEL:-llama3.2}
+  EMBED_MODEL: ${EMBED_MODEL:-bge-m3}
+  # Used by n8n-import to generate the Postgres credential
+  PG_HOST: postgres
+  PG_PORT: "5432"
+  PG_DB: ${POSTGRES_DB:-genx_rag}
+  PG_USER: ${POSTGRES_USER:-genx}
+  PG_PASSWORD: ${POSTGRES_PASSWORD:-genx_local_pw}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: genx-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-genx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-genx_local_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-genx_rag}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"   # 5433 on the host avoids clashing with a local Postgres
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  n8n-import:
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-latest}
+    container_name: genx-n8n-import
+    environment: *n8n-env
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        cat > /tmp/credentials.json <<EOF
+        [{
+          "id": "GxPgvectorCred01",
+          "name": "GenX pgvector",
+          "type": "postgres",
+          "data": {
+            "host": "$${PG_HOST}", "port": $${PG_PORT}, "database": "$${PG_DB}",
+            "user": "$${PG_USER}", "password": "$${PG_PASSWORD}",
+            "ssl": "disable", "allowUnauthorizedCerts": false, "sshTunnel": false
+          }
+        }]
+        EOF
+        n8n import:credentials --input=/tmp/credentials.json
+        n8n import:workflow --separate --input=/import/workflows
+        # Publish (activate) both workflows so their webhooks are live on start
+        n8n publish:workflow --id=GxIngestFirewl01
+        n8n publish:workflow --id=GxGatedRetrvl001
+        rm -f /tmp/credentials.json
+        echo "Credential + workflows imported."
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/import/workflows:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-latest}
+    container_name: genx-n8n
+    restart: unless-stopped
+    environment: *n8n-env
+    ports:
+      - "5678:5678"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # reach Ollama on the host (Linux needs this line)
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      n8n-import:
+        condition: service_completed_successfully
+
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    container_name: genx-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  pg_data:
+  n8n_data:
+  ollama_data:
