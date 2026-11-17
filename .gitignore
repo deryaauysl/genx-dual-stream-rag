@@ -1,3 +1,18 @@
+# Submission documents (uploaded separately to the form)
+PROJECT_REPORT.md
+PROMPTS.md
+PROMPTS_FINAL.md
+
+# Assessment PDF
+*.pdf
+
+# Claude memory
+.claude/
+
+# Duplicate data file at root (data/ folder has the canonical copy)
+/mock_transcripts.json
+
+# Environment & dependencies
 .env
 node_modules/
 *.log
